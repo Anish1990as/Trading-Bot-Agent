@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pydantic-settings
+alembic
+pandas
+pandas-ta
+pytz
+APScheduler
+requests
+yfinance
+jugaad-data
+python-telegram-bot
+python-dotenv
+pyarrow

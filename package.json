@@ -1,0 +1,10 @@
+{
+  "name": "dhanscanner",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File .\\start-dev.ps1",
+    "frontend": "npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173",
+    "backend": "py -3.13 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000"
+  }
+}

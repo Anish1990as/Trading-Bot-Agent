@@ -1,0 +1,7 @@
+dhanhq
+pandas
+pandas-ta
+requests
+python-dotenv
+scipy
+numpy
