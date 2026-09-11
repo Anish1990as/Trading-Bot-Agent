@@ -306,8 +306,9 @@ class TradingDaemon:
                     self._close_trade(trade, ltp, "Target 2 Hit (+60% Profit) 🎯")
                     continue
 
-                # Stage 1: Target 1 Reached -> Lock Stop-Loss to Breakeven (Cost-to-Cost)
-                if trade.target_1 is not None and ltp >= trade.target_1 and (trade.highest_target_hit or 0) < 1:
+                # Stage 1: Halfway to Target 1 -> Lock Stop-Loss to Breakeven.
+                trail_activation = trade.entry_price + (trade.target_1 - trade.entry_price) * 0.5 if trade.target_1 is not None else None
+                if trail_activation is not None and ltp >= trail_activation and (trade.highest_target_hit or 0) < 1:
                     trade.highest_target_hit = 1
                     breakeven_sl = round(trade.entry_price, 2)
                     if breakeven_sl > trade.current_sl:
@@ -353,7 +354,8 @@ class TradingDaemon:
                     self._close_trade(trade, ltp, "Target 2 Hit (+60% Profit) 🎯")
                     continue
 
-                if trade.target_1 is not None and ltp <= trade.target_1 and (trade.highest_target_hit or 0) < 1:
+                trail_activation = trade.entry_price - (trade.entry_price - trade.target_1) * 0.5 if trade.target_1 is not None else None
+                if trail_activation is not None and ltp <= trail_activation and (trade.highest_target_hit or 0) < 1:
                     trade.highest_target_hit = 1
                     breakeven_sl = round(trade.entry_price, 2)
                     if breakeven_sl < trade.current_sl:
