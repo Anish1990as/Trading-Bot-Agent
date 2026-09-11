@@ -8,15 +8,29 @@ from zoneinfo import ZoneInfo
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
+
+# Ensure .env is explicitly loaded from root directory
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_env_path):
+    load_dotenv(_env_path, override=True)
+else:
+    load_dotenv(override=True)
+
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.database import SessionLocal, engine
+from backend.execution_engine.dhan_execution import DhanExecutionEngine
 from backend.execution_engine.paper_trading import PaperExecutionEngine
 from backend.market_data.fetcher import MarketDataFetcher
 from backend.models import Base, Settings, Signal, Trade, Watchlist
 from backend.notifications.telegram_bot import TelegramNotifier
-from backend.options_helper import build_options_info, get_live_nse_option_ltp
+from backend.options_helper import (
+    _symbol_key,
+    build_options_info,
+    get_dhan_option_ltp,
+    get_dhan_option_security_id,
+)
 from backend.risk_management.risk_manager import RiskManager
 from backend.strategy_engine.ai_signal_engine import AISignalEngine
 from backend.trade_metadata import (
@@ -32,7 +46,10 @@ class TradingDaemon:
     def __init__(self):
         Base.metadata.create_all(bind=engine)
         self.db: Session = SessionLocal()
-        load_dotenv()
+        if os.path.exists(_env_path):
+            load_dotenv(_env_path, override=True)
+        else:
+            load_dotenv(override=True)
 
         settings = self.db.query(Settings).first()
         if settings is None:
@@ -47,8 +64,13 @@ class TradingDaemon:
 
         data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.timeframes = self._env_list("TRADE_TIMEFRAMES", ["5m", "15m"])
+        self.scan_interval = float(os.getenv("SCAN_INTERVAL_SECONDS", "0.5"))
         self.symbol_filter = {
             symbol.upper() for symbol in self._env_list("TRADE_SYMBOLS", [])
+        }
+        self.symbol_enabled = {
+            symbol: os.getenv(f"TRADE_{symbol}_ENABLED", "true").lower() != "false"
+            for symbol in (self.symbol_filter or {"NIFTY", "BANKNIFTY", "SENSEX"})
         }
         self.min_trade_confidence = int(
             os.getenv(
@@ -62,7 +84,7 @@ class TradingDaemon:
             self._symbol_key(symbol)
             for symbol in self._env_list(
                 "TRADE_BLOCK_OVERRIDE_SYMBOLS",
-                ["NIFTY", "NIFTY 50"],
+                [],
             )
         }
         self.fetcher = MarketDataFetcher(data_dir=data_dir)
@@ -74,18 +96,39 @@ class TradingDaemon:
             daily_profit_target=self.settings.daily_profit_target,
             max_open_trades=int(os.getenv("MAX_OPEN_TRADES", "4")),
         )
-        self.execution_engine = PaperExecutionEngine(db_session=self.db)
+        self.paper_trading = os.getenv(
+            "PAPER_TRADING", str(self.settings.paper_trading)
+        ).lower() != "false"
+        if self.paper_trading:
+            self.execution_engine = PaperExecutionEngine(db_session=self.db)
+        else:
+            self.execution_engine = DhanExecutionEngine(db_session=self.db)
+        self.reconciliation_failed = False
         self.telegram = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
 
         self.ist = ZoneInfo("Asia/Kolkata")
         self.entry_start_time = dt_time(9, 15)
-        self.square_off_time = dt_time(15, 20)
+        self.square_off_time = dt_time(15, 10)
 
         if self.db.query(Watchlist).count() == 0:
             self.db.bulk_save_objects(
                 [
                     Watchlist(symbol="NIFTY", exchange="NSE"),
                     Watchlist(symbol="BANKNIFTY", exchange="NSE"),
+                ]
+            )
+            self.db.commit()
+        configured_symbols = self.symbol_filter or {"NIFTY", "BANKNIFTY"}
+        existing_symbols = {item.symbol.upper() for item in self.db.query(Watchlist).all()}
+        missing_symbols = configured_symbols - existing_symbols
+        if missing_symbols:
+            self.db.bulk_save_objects(
+                [
+                    Watchlist(
+                        symbol=symbol,
+                        exchange="BSE" if symbol == "SENSEX" else "NSE",
+                    )
+                    for symbol in missing_symbols
                 ]
             )
             self.db.commit()
@@ -144,6 +187,17 @@ class TradingDaemon:
             open_risk=open_risk,
         )
 
+    def _reconcile_live_positions(self) -> bool:
+        if self.paper_trading:
+            return True
+        for trade in self.db.query(Trade).filter(Trade.status == "OPEN").all():
+            if not self.execution_engine.reconcile_trade(trade):
+                print(f"Live position mismatch for {self._display_symbol(trade)}; halting entries.")
+                self.reconciliation_failed = True
+                return False
+        self.reconciliation_failed = False
+        return True
+
     def _remaining_trade_risk(self, trade: Trade) -> float:
         risk_price = trade.current_sl if trade.current_sl is not None else trade.stop_loss
         if risk_price is None:
@@ -162,38 +216,34 @@ class TradingDaemon:
         return display_symbol(trade.symbol, self._trade_metadata(trade))
 
     def _latest_underlying_price(self, symbol: str) -> float | None:
-        df = self.fetcher.fetch_live_data(symbol, "NSE", "1m")
+        exchange = "BSE" if symbol.upper() == "SENSEX" else "NSE"
+        df = self.fetcher.fetch_live_data(symbol, exchange, "1m")
         if df is None or df.empty:
             return None
         return float(df.iloc[-1]["close"])
 
-    def _latest_price(self, trade: Trade) -> float:
+    def _latest_price(self, trade: Trade) -> float | None:
         metadata = self._trade_metadata(trade)
         if is_option_execution(metadata):
-            option_ltp = get_live_nse_option_ltp(
-                trade.symbol,
-                metadata["opt_type"],
-                metadata["strike"],
-                metadata.get("expiry"),
-            )
-            if option_ltp is not None and option_ltp > 0:
-                return float(option_ltp)
+            symbol_key = _symbol_key(trade.symbol)
+            segment = "BSE_FNO" if symbol_key == "SENSEX" else "NSE_FNO"
+            security_id = metadata.get("security_id")
+            if not security_id:
+                security_id = get_dhan_option_security_id(
+                    symbol_key,
+                    metadata.get("opt_type", "CE"),
+                    int(metadata.get("strike", 0)),
+                    metadata.get("expiry", ""),
+                )
+            if security_id:
+                option_ltp = get_dhan_option_ltp(security_id, segment)
+                if option_ltp is not None and option_ltp > 0:
+                    return float(option_ltp)
 
-            spot = self._latest_underlying_price(trade.symbol)
-            underlying_entry = metadata.get("underlying_entry")
-            if spot is not None and underlying_entry:
-                direction = trade_direction(trade.trade_type, metadata)
-                spot_move = spot - underlying_entry if direction == "BUY" else underlying_entry - spot
-                return round(max(0.05, trade.entry_price + (spot_move * 0.45)), 2)
+            # Strictly NEVER fake or guess option price. Skip tick if Dhan LTP is temporarily unavailable.
+            return None
 
-            print(f"Could not fetch {self._display_symbol(trade)}; using entry premium.")
-            return float(trade.entry_price)
-
-        spot = self._latest_underlying_price(trade.symbol)
-        if spot is not None:
-            return spot
-        print(f"Could not fetch {trade.symbol}; using entry price.")
-        return float(trade.entry_price)
+        return self._latest_underlying_price(trade.symbol)
 
     def _close_trade(self, trade: Trade, exit_price: float, reason: str) -> Trade | None:
         symbol = self._display_symbol(trade)
@@ -225,7 +275,9 @@ class TradingDaemon:
         for trade in open_trades:
             reason = self._square_off_required(trade, now_ist)
             if reason:
-                self._close_trade(trade, self._latest_price(trade), reason)
+                exit_price = self._latest_price(trade)
+                if exit_price is not None:
+                    self._close_trade(trade, exit_price, reason)
                 closed_any = True
 
         return closed_any
@@ -237,62 +289,106 @@ class TradingDaemon:
 
         for trade in open_trades:
             ltp = self._latest_price(trade)
+            if ltp is None:
+                print(f"Skipping {self._display_symbol(trade)}: Dhan quote unavailable.")
+                continue
             symbol = self._display_symbol(trade)
 
             metadata = self._trade_metadata(trade)
             
-            if trade.stop_loss:
-                trail_distance = abs(trade.entry_price - trade.stop_loss)
-            else:
-                trail_distance = 15.0
+            if trade.current_sl is None:
+                trade.current_sl = trade.stop_loss
+                self.db.commit()
 
             if trade.trade_type == "BUY":
-                new_sl = round(ltp - trail_distance, 2)
-                if trade.current_sl is None or new_sl > trade.current_sl:
-                    previous_sl = trade.current_sl if trade.current_sl is not None else trade.stop_loss
-                    last_alert_sl = metadata.get("last_alert_sl", trade.stop_loss or 0)
-                    trade.current_sl = new_sl
-                    self.db.commit()
-                    
-                    if new_sl - last_alert_sl >= 5.0:
-                        metadata["last_alert_sl"] = new_sl
+                # Check Target 2 Hit (Full Profit Booking)
+                if trade.target_2 is not None and ltp >= trade.target_2:
+                    self._close_trade(trade, ltp, "Target 2 Hit (+60% Profit) 🎯")
+                    continue
+
+                # Stage 1: Target 1 Reached -> Lock Stop-Loss to Breakeven (Cost-to-Cost)
+                if trade.target_1 is not None and ltp >= trade.target_1 and (trade.highest_target_hit or 0) < 1:
+                    trade.highest_target_hit = 1
+                    breakeven_sl = round(trade.entry_price, 2)
+                    if breakeven_sl > trade.current_sl:
+                        previous_sl = trade.current_sl
+                        trade.current_sl = breakeven_sl
+                        metadata["last_alert_sl"] = breakeven_sl
                         trade.notes = serialize_trade_metadata(metadata)
                         self.db.commit()
                         self.telegram.send_trailing_sl_alert(
                             symbol=symbol,
                             previous_sl=previous_sl,
-                            new_sl=new_sl,
+                            new_sl=breakeven_sl,
                             current_price=ltp,
                         )
 
+                # Stage 2: Beyond Target 1 -> Progressive Profit Trail
+                elif (trade.highest_target_hit or 0) >= 1 and trade.target_1 is not None:
+                    # Trail 60% of open profit above Target 1
+                    profit_trail_sl = round(trade.entry_price + (ltp - trade.target_1) * 0.6, 2)
+                    if profit_trail_sl > trade.current_sl:
+                        previous_sl = trade.current_sl
+                        last_alert_sl = metadata.get("last_alert_sl", trade.entry_price)
+                        trade.current_sl = profit_trail_sl
+                        self.db.commit()
+                        if profit_trail_sl - last_alert_sl >= 5.0:
+                            metadata["last_alert_sl"] = profit_trail_sl
+                            trade.notes = serialize_trade_metadata(metadata)
+                            self.db.commit()
+                            self.telegram.send_trailing_sl_alert(
+                                symbol=symbol,
+                                previous_sl=previous_sl,
+                                new_sl=profit_trail_sl,
+                                current_price=ltp,
+                            )
+
+                # Exit on Stop-Loss or Trailing SL
                 if trade.current_sl is not None and ltp <= trade.current_sl:
-                    self._close_trade(trade, trade.current_sl, "Trailing SL Hit")
-                elif trade.target_2 is not None and ltp >= trade.target_2:
-                    self._close_trade(trade, trade.target_2, "Target 2 Hit")
+                    reason = "Target 1 Breakeven Exit" if (trade.highest_target_hit or 0) >= 1 else "Stop Loss Hit"
+                    self._close_trade(trade, ltp, reason)
 
             elif trade.trade_type == "SELL":
-                new_sl = round(ltp + trail_distance, 2)
-                if trade.current_sl is None or new_sl < trade.current_sl:
-                    previous_sl = trade.current_sl if trade.current_sl is not None else trade.stop_loss
-                    last_alert_sl = metadata.get("last_alert_sl", trade.stop_loss or float('inf'))
-                    trade.current_sl = new_sl
-                    self.db.commit()
-                    
-                    if last_alert_sl - new_sl >= 5.0:
-                        metadata["last_alert_sl"] = new_sl
+                if trade.target_2 is not None and ltp <= trade.target_2:
+                    self._close_trade(trade, ltp, "Target 2 Hit (+60% Profit) 🎯")
+                    continue
+
+                if trade.target_1 is not None and ltp <= trade.target_1 and (trade.highest_target_hit or 0) < 1:
+                    trade.highest_target_hit = 1
+                    breakeven_sl = round(trade.entry_price, 2)
+                    if breakeven_sl < trade.current_sl:
+                        previous_sl = trade.current_sl
+                        trade.current_sl = breakeven_sl
+                        metadata["last_alert_sl"] = breakeven_sl
                         trade.notes = serialize_trade_metadata(metadata)
                         self.db.commit()
                         self.telegram.send_trailing_sl_alert(
                             symbol=symbol,
                             previous_sl=previous_sl,
-                            new_sl=new_sl,
+                            new_sl=breakeven_sl,
                             current_price=ltp,
                         )
+                elif (trade.highest_target_hit or 0) >= 1 and trade.target_1 is not None:
+                    profit_trail_sl = round(trade.entry_price - (trade.target_1 - ltp) * 0.6, 2)
+                    if profit_trail_sl < trade.current_sl:
+                        previous_sl = trade.current_sl
+                        last_alert_sl = metadata.get("last_alert_sl", trade.entry_price)
+                        trade.current_sl = profit_trail_sl
+                        self.db.commit()
+                        if last_alert_sl - profit_trail_sl >= 5.0:
+                            metadata["last_alert_sl"] = profit_trail_sl
+                            trade.notes = serialize_trade_metadata(metadata)
+                            self.db.commit()
+                            self.telegram.send_trailing_sl_alert(
+                                symbol=symbol,
+                                previous_sl=previous_sl,
+                                new_sl=profit_trail_sl,
+                                current_price=ltp,
+                            )
 
                 if trade.current_sl is not None and ltp >= trade.current_sl:
-                    self._close_trade(trade, trade.current_sl, "Trailing SL Hit")
-                elif trade.target_2 is not None and ltp <= trade.target_2:
-                    self._close_trade(trade, trade.target_2, "Target 2 Hit")
+                    reason = "Target 1 Breakeven Exit" if (trade.highest_target_hit or 0) >= 1 else "Stop Loss Hit"
+                    self._close_trade(trade, ltp, reason)
 
     def _create_signal_record(self, signal_data: dict) -> Signal:
         signal = Signal(
@@ -425,6 +521,38 @@ class TradingDaemon:
                 f"loss cooldown active for {self.loss_cooldown_minutes} minutes."
             )
 
+        # 🛡️ Strict Sideways & Multi-Timeframe Chop Protection Filter
+        companion_tf = "5m" if timeframe == "15m" else "15m"
+        fetcher = getattr(self, "fetcher", None)
+        companion_df = (
+            fetcher.fetch_live_data(
+                item.symbol, "BSE" if item.symbol == "SENSEX" else "NSE", companion_tf
+            )
+            if fetcher
+            else None
+        )
+        ai_engine = getattr(self, "ai_engine", None)
+        if companion_df is not None and not companion_df.empty and ai_engine is not None:
+            companion_eval = ai_engine.multi_engine.evaluate_all(companion_df)
+            if companion_eval.get("is_sideways") or companion_eval.get("adx", 25.0) < 18.0:
+                if not override_blocks:
+                    self._set_signal_status(signal_record, "IGNORED")
+                    print(
+                        f"Skipping {item.symbol} {timeframe}: Companion timeframe ({companion_tf}) "
+                        f"is Sideways (ADX: {companion_eval.get('adx')}). Chop Protection active."
+                    )
+                    return
+            companion_trend = companion_eval.get("master_trend")
+            signal_dir = signal_data.get("signal")
+            expected_trend = "BULLISH" if signal_dir == "BUY" else "BEARISH"
+            if companion_trend not in (expected_trend, "NEUTRAL") and not override_blocks:
+                self._set_signal_status(signal_record, "IGNORED")
+                print(
+                    f"Skipping {item.symbol} {timeframe}: Multi-Timeframe Conflict "
+                    f"({timeframe} {signal_dir} vs {companion_tf} {companion_trend}). Trade Blocked."
+                )
+                return
+
         existing_trade = self._open_trade_for_timeframe(item.symbol, timeframe)
 
         if existing_trade:
@@ -472,11 +600,32 @@ class TradingDaemon:
                     f"reversal entry risk check failed: {risk_check['reason']}"
                 )
 
+        paper_trading = getattr(self, "paper_trading", self.settings.paper_trading)
         options_info = build_options_info(
             symbol=item.symbol,
             signal=signal_data["signal"],
             spot_price=signal_data["entry"],
         )
+        security_id = get_dhan_option_security_id(
+            item.symbol,
+            options_info["opt_type"],
+            options_info["strike"],
+            options_info["expiry"],
+        )
+        segment = "BSE_FNO" if item.symbol.upper() == "SENSEX" else "NSE_FNO"
+        option_ltp = get_dhan_option_ltp(security_id, segment) if security_id else None
+        if option_ltp is not None:
+            options_info["premium"] = option_ltp
+            risk_pct = 0.18
+            options_info["sl"] = round(option_ltp * (1 - risk_pct), 1)
+            options_info["t1"] = round(option_ltp * 1.25, 1)
+            options_info["t2"] = round(option_ltp * 1.60, 1)
+        elif not paper_trading:
+            if option_ltp is None:
+                self._set_signal_status(signal_record, "IGNORED")
+                print("Live trade blocked: Dhan option quote unavailable.")
+                return
+
         pos_info = self.risk_manager.calculate_position_size(
             entry_price=options_info["premium"],
             stop_loss=options_info["sl"],
@@ -521,11 +670,6 @@ class TradingDaemon:
                 f"{risk_check['reason']}"
             )
 
-        if not self.settings.paper_trading:
-            self._set_signal_status(signal_record, "IGNORED")
-            print("Live trading is not configured; signal was not executed.")
-            return
-
         metadata = {
             **options_info,
             "execution_instrument": "OPTION",
@@ -533,26 +677,55 @@ class TradingDaemon:
             "underlying_entry": float(signal_data["entry"]),
             "timeframe": timeframe,
         }
-        trade = self.execution_engine.place_market_order(
-            symbol=signal_data["symbol"],
-            action="BUY",
-            quantity=pos_info["qty"],
-            price=options_info["premium"],
-            strategy=f"AI_Confluence_{timeframe}",
-            sl=options_info["sl"],
-            t1=options_info["t1"],
-            t2=options_info["t2"],
-            notes=serialize_trade_metadata(metadata),
-        )
-        self._set_signal_status(signal_record, "EXECUTED")
-        self._sync_risk_state()
-        self.telegram.send_trade_alert(signal_data, options_info)
-        print(
-            f"Option trade executed: {self._display_symbol(trade)} "
-            f"BUY {trade.quantity} @ {trade.entry_price}"
-        )
+        paper_trading = getattr(self, "paper_trading", self.settings.paper_trading)
+        if security_id:
+            metadata["security_id"] = security_id
+        if not paper_trading:
+            if not security_id:
+                self._set_signal_status(signal_record, "IGNORED")
+                print("Live trade blocked: Dhan security ID could not be resolved.")
+                return
+            metadata["security_id"] = security_id
+
+        try:
+            if paper_trading:
+                trade = self.execution_engine.place_market_order(
+                    symbol=signal_data["symbol"], action="BUY", quantity=pos_info["qty"],
+                    price=options_info["premium"], strategy=f"AI_Confluence_{timeframe}",
+                    sl=options_info["sl"], t1=options_info["t1"], t2=options_info["t2"],
+                    notes=serialize_trade_metadata(metadata),
+                )
+            else:
+                trade = self.execution_engine.place_super_order(
+                    symbol=signal_data["symbol"], action="BUY", quantity=pos_info["qty"],
+                    price=options_info["premium"], strategy=f"AI_Confluence_{timeframe}",
+                    sl=options_info["sl"], t1=options_info["t1"], t2=options_info["t2"],
+                    notes=serialize_trade_metadata(metadata),
+                )
+            self._set_signal_status(signal_record, "EXECUTED")
+            self._sync_risk_state()
+            self.telegram.send_trade_alert(signal_data, options_info)
+            print(
+                f"Option trade executed: {self._display_symbol(trade)} "
+                f"BUY {trade.quantity} @ {trade.entry_price}"
+            )
+        except Exception as exc:
+            self._set_signal_status(signal_record, "FAILED")
+            print(f"\n❌ [DHAN ORDER REJECTED] {item.symbol} {timeframe}: {exc}\n")
+            try:
+                self.telegram.send_message(
+                    f"⚠️ <b>Dhan Order Rejected</b>\n\n"
+                    f"• <b>Symbol:</b> {item.symbol} {options_info.get('opt_type', '')} {options_info.get('strike', '')}\n"
+                    f"• <b>Reason:</b> <code>{str(exc)}</code>\n"
+                    f"• <b>Action:</b> Check Dhan account funds / margin limit."
+                )
+            except Exception:
+                pass
+            return
 
     def _run_cycle(self) -> None:
+        if not self._reconcile_live_positions():
+            return
         if self._square_off_open_trades():
             return
 
@@ -570,7 +743,16 @@ class TradingDaemon:
         )
         if self.symbol_filter:
             active_symbols = [
-                item for item in active_symbols if item.symbol.upper() in self.symbol_filter
+                item
+                for item in active_symbols
+                if item.symbol.upper() in self.symbol_filter
+                and self.symbol_enabled.get(item.symbol.upper(), True)
+            ]
+        else:
+            active_symbols = [
+                item
+                for item in active_symbols
+                if self.symbol_enabled.get(item.symbol.upper(), True)
             ]
         if not active_symbols:
             print("Watchlist empty.")
@@ -592,10 +774,10 @@ class TradingDaemon:
                     self.db.rollback()
                     print(f"Failed processing {item.symbol} {timeframe}:")
                     traceback.print_exc()
-                time.sleep(2)
+                time.sleep(0.4)
 
     def run(self):
-        print("Trading Daemon Started...")
+        print(f"Trading Daemon Started (Scan Interval: {self.scan_interval}s, Timeframes: {self.timeframes})...")
         self.telegram.send_message(
             "<b>Algorithmic Trading Engine Started</b>\n\n"
             "Connected to market data and strategy engine."
@@ -610,7 +792,7 @@ class TradingDaemon:
                 self.db.rollback()
                 print("Trading cycle failed; retrying next cycle:")
                 traceback.print_exc()
-            time.sleep(60)
+            time.sleep(self.scan_interval)
 
 
 if __name__ == "__main__":

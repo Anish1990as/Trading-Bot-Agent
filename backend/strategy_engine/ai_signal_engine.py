@@ -7,7 +7,7 @@ from .advanced_strategies import (
     ORBStrategy, MTFConfluenceStrategy, RSIMACDDivergenceStrategy, StochRSIStrategy
 )
 import pandas as pd
-from .indicators import atr
+from .indicators import atr, adx
 
 class MultiConfirmationEngine:
     def __init__(self):
@@ -30,6 +30,11 @@ class MultiConfirmationEngine:
 
     def evaluate_all(self, df: pd.DataFrame) -> dict:
         results = {}
+        
+        # 0. ADX Trend Strength & Chop Filter
+        adx_series, plus_di, minus_di = adx(df, 14)
+        latest_adx = float(adx_series.iloc[-1]) if len(adx_series) > 0 and not pd.isna(adx_series.iloc[-1]) else 25.0
+        is_sideways = latest_adx < 20.0
         
         # 1. Evaluate Primary Trend Filters
         bullish_trend_votes = 0
@@ -74,17 +79,18 @@ class MultiConfirmationEngine:
             elif res.get("signal") == "SELL":
                 sell_triggers += 1
                 
-        # 3. Smart Confluence Logic
+        # 3. Smart Confluence Logic with Strict Sideways Protection
         overall_signal = "NEUTRAL"
         base_confidence = 0
         
-        # Trade is taken only when trend has strong agreement and at least
-        # two trigger strategies confirm the entry.
-        if master_trend == "BULLISH" and bullish_trend_votes >= 3 and buy_triggers >= 2:
+        # Trade is STRICTLY BLOCKED if market is in Sideways / Chop regime (ADX < 20.0)
+        if is_sideways:
+            overall_signal = "NEUTRAL"
+            base_confidence = 0
+        elif master_trend == "BULLISH" and bullish_trend_votes >= 3 and buy_triggers >= 2 and latest_adx >= 20.0:
             overall_signal = "BUY"
-            # Base confidence starts at 60 and scales with more confluence
             base_confidence = min(100, 60 + (buy_triggers * 10) + (bullish_trend_votes * 5))
-        elif master_trend == "BEARISH" and bearish_trend_votes >= 3 and sell_triggers >= 2:
+        elif master_trend == "BEARISH" and bearish_trend_votes >= 3 and sell_triggers >= 2 and latest_adx >= 20.0:
             overall_signal = "SELL"
             base_confidence = min(100, 60 + (sell_triggers * 10) + (bearish_trend_votes * 5))
             
@@ -94,7 +100,9 @@ class MultiConfirmationEngine:
             "buy_votes": buy_triggers,
             "sell_votes": sell_triggers,
             "strategy_breakdown": results,
-            "master_trend": master_trend
+            "master_trend": master_trend,
+            "adx": round(latest_adx, 2),
+            "is_sideways": is_sideways,
         }
 
 class AISignalEngine:
@@ -106,9 +114,18 @@ class AISignalEngine:
         
         signal_type = confluence["overall_signal"]
         confidence = confluence["base_confidence"]
+        adx_val = confluence.get("adx", 25.0)
+        
+        if confluence.get("is_sideways") or adx_val < 20.0:
+            return {
+                "action": "IGNORE",
+                "reason": f"Sideways Chop Detected (ADX: {adx_val:.1f} < 20.0). Entry Strictly Blocked.",
+                "adx": adx_val,
+                "is_sideways": True,
+            }
         
         if signal_type == "NEUTRAL" or confidence < 75:
-            return {"action": "IGNORE", "reason": "Low Confidence or Neutral"}
+            return {"action": "IGNORE", "reason": "Low Confidence or Neutral", "adx": adx_val}
             
         curr_price = df.iloc[-1]['close']
         atr = self._calculate_atr(df)

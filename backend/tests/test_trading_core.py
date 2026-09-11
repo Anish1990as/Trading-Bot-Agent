@@ -2,14 +2,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.app_daemon import TradingDaemon
 from backend.database import Base
+from backend.execution_engine.dhan_execution import DhanExecutionEngine
 from backend.execution_engine.paper_trading import PaperExecutionEngine
 from backend.models import Signal, Trade, Watchlist
-from backend.options_helper import _fallback_expiry, build_options_info
+from backend.options_helper import (
+    _fallback_expiry,
+    build_options_info,
+    get_dhan_option_security_id,
+)
 from backend.risk_management.risk_manager import RiskManager
 from backend.trade_metadata import (
     display_symbol,
@@ -104,6 +110,27 @@ class PaperExecutionTests(unittest.TestCase):
         self.assertEqual(trade_direction(closed.trade_type, saved_metadata), "SELL")
         self.assertEqual(display_symbol(closed.symbol, saved_metadata), "NIFTY 24000 PE")
         self.assertTrue(is_option_execution(saved_metadata))
+
+
+class DhanExecutionSafetyTests(unittest.TestCase):
+    def test_dummy_configuration_cannot_place_orders(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "DHAN_CLIENT_ID": "DUMMY",
+                "DHAN_ACCESS_TOKEN": "DUMMY",
+                "LIVE_TRADING_ENABLED": "true",
+            },
+        ):
+            execution = DhanExecutionEngine(Mock())
+            with self.assertRaisesRegex(RuntimeError, "Dummy Dhan credentials"):
+                execution._assert_ready()
+
+    def test_live_trading_is_disabled_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            execution = DhanExecutionEngine(Mock())
+            with self.assertRaisesRegex(RuntimeError, "Live trading is disabled"):
+                execution._assert_ready()
 
 
 class TimeframeEntryTests(unittest.TestCase):
@@ -247,28 +274,70 @@ class ExpiryFallbackTests(unittest.TestCase):
 
 
 class OptionsHelperTests(unittest.TestCase):
-    @patch("backend.options_helper.get_live_nse_option_ltp", return_value=100)
+    @patch("backend.options_helper.pd.read_csv")
+    def test_nifty_option_security_id_uses_nse_exchange_code(self, read_csv):
+        read_csv.return_value = pd.DataFrame(
+            {
+                "SEM_EXM_EXCH_ID": ["NSE"],
+                "SEM_INSTRUMENT_NAME": ["OPTIDX"],
+                "SEM_OPTION_TYPE": ["PE"],
+                "SEM_STRIKE_PRICE": [23450],
+                "SEM_TRADING_SYMBOL": ["NIFTY-Sep2026-23450-PE"],
+                "SEM_EXPIRY_DATE": ["2026-09-15 14:30:00"],
+                "SEM_SMST_SECURITY_ID": [47296],
+            }
+        )
+
+        self.assertEqual(
+            get_dhan_option_security_id("NIFTY", "PE", 23450, "15 Sep 2026"),
+            "47296",
+        )
+
+    @patch("backend.options_helper.get_dhan_option_ltp", return_value=None)
+    @patch("backend.options_helper.estimate_option_premium", return_value=100)
     @patch("backend.options_helper.get_nearest_expiry", return_value="25 Aug 2026")
     def test_nifty_options_use_five_percent_stop_loss(self, *_):
         options_info = build_options_info("NIFTY", "BUY", 24000)
 
-        self.assertEqual(options_info["sl"], 95)
+        self.assertEqual(options_info["sl"], 82)
         self.assertEqual(options_info["lot_size"], 65)
 
-    @patch("backend.options_helper.get_live_nse_option_ltp", return_value=100)
+    @patch("backend.options_helper.get_dhan_option_ltp", return_value=None)
+    @patch("backend.options_helper.estimate_option_premium", return_value=100)
     @patch("backend.options_helper.get_nearest_expiry", return_value="25 Aug 2026")
     def test_nifty_50_alias_uses_five_percent_stop_loss(self, *_):
         options_info = build_options_info("NIFTY 50", "BUY", 24000)
 
-        self.assertEqual(options_info["sl"], 95)
+        self.assertEqual(options_info["sl"], 82)
         self.assertEqual(options_info["lot_size"], 65)
 
-    @patch("backend.options_helper.get_live_nse_option_ltp", return_value=100)
+    @patch("backend.options_helper.get_dhan_option_ltp", return_value=None)
+    @patch("backend.options_helper.estimate_option_premium", return_value=100)
     @patch("backend.options_helper.get_nearest_expiry", return_value="25 Aug 2026")
     def test_banknifty_keeps_existing_fifteen_percent_stop_loss(self, *_):
         options_info = build_options_info("BANKNIFTY", "BUY", 48000)
 
-        self.assertEqual(options_info["sl"], 85)
+        self.assertEqual(options_info["sl"], 82)
+
+
+class ChopProtectionTests(unittest.TestCase):
+    def test_low_adx_blocks_trade_signal(self):
+        from backend.strategy_engine.ai_signal_engine import AISignalEngine
+        import numpy as np
+
+        engine = AISignalEngine()
+        # Generate 100 flat/sideways candles
+        flat_prices = [24000 + (i % 3) for i in range(100)]
+        df = pd.DataFrame({
+            "open": flat_prices,
+            "high": [p + 2 for p in flat_prices],
+            "low": [p - 2 for p in flat_prices],
+            "close": flat_prices,
+            "volume": [1000] * 100,
+        })
+        signal = engine.generate_signal(df, "NIFTY")
+        self.assertEqual(signal["action"], "IGNORE")
+        self.assertTrue("Sideways" in signal["reason"] or "Low Confidence" in signal["reason"])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,13 @@
 import math
 import calendar
+import os
 import time
 from threading import Lock
 from datetime import datetime, timedelta, time as dt_time
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
 
 # The dashboard requests both the open-trade and recent-trade endpoints at the
@@ -19,6 +24,7 @@ _option_ltp_cache_lock = Lock()
 LOT_SIZES = {
     "NIFTY": 65,
     "BANKNIFTY": 30,
+    "SENSEX": 20,
     "FINNIFTY": 60,
     "MIDCPNIFTY": 120,
 }
@@ -27,6 +33,7 @@ LOT_SIZES = {
 EXPIRY_WEEKDAYS = {
     "NIFTY": 1,
     "BANKNIFTY": 1,
+    "SENSEX": 3,
     "FINNIFTY": 1,
     "MIDCPNIFTY": 1,
 }
@@ -56,15 +63,16 @@ def _last_weekday_of_month(year: int, month: int, weekday: int) -> datetime:
 
 def _fallback_expiry(symbol: str, now: datetime) -> datetime:
     weekday = EXPIRY_WEEKDAYS.get(symbol.upper(), 1)
-    if symbol.upper() == "NIFTY":
+    if symbol.upper() in {"NIFTY", "SENSEX"}:
         days = (weekday - now.weekday()) % 7
-        if days == 0 and now.time() > dt_time(15, 30):
+        # On expiry day after 1:00 PM, roll over to next weekly expiry to avoid 0-DTE theta decay crush
+        if days == 0 and now.time() > dt_time(13, 0):
             days = 7
         return now + timedelta(days=days)
 
     expiry = _last_weekday_of_month(now.year, now.month, weekday)
     if expiry.date() < now.date() or (
-        expiry.date() == now.date() and now.time() > dt_time(15, 30)
+        expiry.date() == now.date() and now.time() > dt_time(13, 0)
     ):
         next_month = 1 if now.month == 12 else now.month + 1
         next_year = now.year + 1 if now.month == 12 else now.year
@@ -72,32 +80,57 @@ def _fallback_expiry(symbol: str, now: datetime) -> datetime:
     return expiry
 
 
-def get_nearest_expiry(symbol: str) -> str:
-    try:
-        from jugaad_data.nse import NSELive
-        nse = NSELive()
-        if symbol.upper() in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
-            data = nse.index_option_chain(symbol.upper())
-        else:
-            data = nse.stock_option_chain(symbol.upper())
-            
-        expiry_list = data.get("records", {}).get("expiryDates", [])
-        if expiry_list:
-            nearest_expiry = _parse_expiry_date(expiry_list[0])
-            if nearest_expiry:
-                return nearest_expiry.strftime("%d %b %Y")
-    except Exception:
-        pass
+_scrip_master_cache: pd.DataFrame | None = None
+_scrip_master_load_time: float = 0.0
 
+
+def _get_scrip_master() -> pd.DataFrame:
+    global _scrip_master_cache, _scrip_master_load_time
+    now = time.time()
+    if _scrip_master_cache is not None and (now - _scrip_master_load_time) < 3600:
+        return _scrip_master_cache
+
+    local_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "scrip_master_fno.csv")
+    if os.path.exists(local_path) and (now - os.path.getmtime(local_path)) < 86400:
+        try:
+            _scrip_master_cache = pd.read_csv(local_path, low_memory=False)
+            _scrip_master_load_time = now
+            return _scrip_master_cache
+        except Exception:
+            pass
+
+    try:
+        df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
+        fno = df[df["SEM_INSTRUMENT_NAME"].isin(["OPTIDX", "INDEX"])].copy()
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        fno.to_csv(local_path, index=False)
+        _scrip_master_cache = fno
+        _scrip_master_load_time = now
+        return _scrip_master_cache
+    except Exception:
+        if _scrip_master_cache is not None:
+            return _scrip_master_cache
+        return pd.DataFrame()
+
+
+def get_nearest_expiry(symbol: str) -> str:
     now = datetime.now()
     return _fallback_expiry(symbol, now).strftime("%d %b %Y")
 
+
 def get_atm_strike(spot_price: float, symbol: str) -> int:
     """Rounds spot price to nearest ATM strike based on index."""
-    step = 50  # Default (NIFTY, BANKNIFTY, etc.)
-    if "BANK" in symbol.upper():
+    symbol_upper = symbol.upper()
+    if "SENSEX" in symbol_upper:
         step = 100
+    elif "BANK" in symbol_upper:
+        step = 100
+    elif "MIDCP" in symbol_upper:
+        step = 25
+    else:
+        step = 50  # NIFTY, FINNIFTY
     return int(round(spot_price / step) * step)
+
 
 def get_otm_strike(spot_price: float, signal: str, symbol: str) -> int:
     """
@@ -105,9 +138,15 @@ def get_otm_strike(spot_price: float, signal: str, symbol: str) -> int:
     BUY signal → OTM CE (1 strike above ATM)
     SELL signal → OTM PE (1 strike below ATM)
     """
-    step = 50
-    if "BANK" in symbol.upper():
+    symbol_upper = symbol.upper()
+    if "SENSEX" in symbol_upper:
         step = 100
+    elif "BANK" in symbol_upper:
+        step = 100
+    elif "MIDCP" in symbol_upper:
+        step = 25
+    else:
+        step = 50
 
     atm = get_atm_strike(spot_price, symbol)
 
@@ -115,6 +154,7 @@ def get_otm_strike(spot_price: float, signal: str, symbol: str) -> int:
         return atm + step  # OTM Call
     else:
         return atm - step  # OTM Put
+
 
 def _cached_option_ltp(cache_key: tuple[str, str, int, str | None]) -> float | None:
     with _option_ltp_cache_lock:
@@ -134,73 +174,83 @@ def _store_option_ltp(cache_key: tuple[str, str, int, str | None], price: float)
         _option_ltp_cache[cache_key] = (price, time.monotonic())
 
 
-def get_live_nse_option_ltp(
+def get_dhan_option_ltp(security_id: str, exchange_segment: str = "NSE_FNO") -> float | None:
+    """Fetch an option LTP from Dhan's market quote endpoint with rate-limit protection and caching."""
+    if not security_id:
+        return None
+
+    cache_key = (str(security_id), exchange_segment, 0, None)
+    cached = _cached_option_ltp(cache_key)
+    if cached is not None:
+        return cached
+
+    load_dotenv(override=True)
+    client_id = os.getenv("DHAN_CLIENT_ID")
+    access_token = os.getenv("DHAN_ACCESS_TOKEN")
+    if not client_id or not access_token:
+        return None
+
+    try:
+        response = requests.post(
+            "https://api.dhan.co/v2/marketfeed/ltp",
+            headers={
+                "access-token": access_token,
+                "client-id": client_id,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={exchange_segment: [int(security_id)]},
+            timeout=(2.0, 5.0),
+        )
+        if response.status_code == 200:
+            data = response.json().get("data", {}).get(exchange_segment, {})
+            value = data.get(str(security_id), {}).get("last_price")
+            if value and float(value) > 0:
+                price = float(value)
+                _store_option_ltp(cache_key, price)
+                return price
+        elif response.status_code == 429:
+            time.sleep(0.5)
+    except Exception:
+        pass
+    return None
+
+
+def get_dhan_option_security_id(
     symbol: str,
     opt_type: str,
     strike: int,
-    expiry: str | None = None,
-    retries: int = 3,
-) -> float | None:
-    """
-    Fetch live option LTP using jugaad-data to bypass NSE blocking.
-    Uses the trade's saved expiry when available, otherwise the nearest expiry.
-    Successful quotes are cached briefly to avoid NSE throttling between the
-    dashboard's concurrent API calls.
-    """
-    normalized_symbol = _symbol_key(symbol)
-    normalized_type = (opt_type or "").upper()
-    target_expiry = _parse_expiry_date(expiry) if expiry else None
-    cache_key = (
-        normalized_symbol,
-        normalized_type,
-        int(strike),
-        target_expiry.date().isoformat() if target_expiry else None,
-    )
-    cached_price = _cached_option_ltp(cache_key)
-    if cached_price is not None:
-        return cached_price
+    expiry: str,
+) -> str | None:
+    """Resolve the exact Dhan option contract ID from Dhan's scrip master."""
+    try:
+        scrips = _get_scrip_master()
+        if scrips.empty:
+            return None
+        symbol_key = _symbol_key(symbol)
+        exchange_id = "BSE" if symbol_key == "SENSEX" else "NSE"
+        contracts = scrips[
+            (scrips["SEM_EXM_EXCH_ID"] == exchange_id)
+            & (scrips["SEM_INSTRUMENT_NAME"] == "OPTIDX")
+            & (scrips["SEM_OPTION_TYPE"] == opt_type.upper())
+            & (scrips["SEM_STRIKE_PRICE"].astype(float) == float(strike))
+        ]
+        contracts = contracts[
+            contracts["SEM_TRADING_SYMBOL"].astype(str).str.startswith(symbol_key)
+        ]
+        if contracts.empty:
+            return None
+        contracts = contracts.copy()
+        contracts["expiry"] = pd.to_datetime(
+            contracts["SEM_EXPIRY_DATE"], errors="coerce"
+        ).dt.strftime("%d %b %Y")
+        match = contracts[contracts["expiry"] == expiry]
+        if match.empty:
+            return str(contracts.iloc[0]["SEM_SMST_SECURITY_ID"])
+        return str(match.iloc[0]["SEM_SMST_SECURITY_ID"])
+    except Exception:
+        return None
 
-    for attempt in range(retries):
-        try:
-            from jugaad_data.nse import NSELive
-            nse = NSELive()
-            
-            # Determine if it's index or stock. For DhanScanner, we assume NIFTY/BANKNIFTY are indices.
-            if symbol.upper() in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
-                data = nse.index_option_chain(symbol.upper())
-            else:
-                data = nse.stock_option_chain(symbol.upper())
-                
-            records = data.get("records", {}).get("data", [])
-            expiry_list = data.get("records", {}).get("expiryDates", [])
-            
-            if not expiry_list:
-                time.sleep(1)
-                continue
-                
-            selected_expiry = target_expiry or _parse_expiry_date(expiry_list[0])
-            if selected_expiry is None:
-                time.sleep(1)
-                continue
-            
-            for record in records:
-                if record.get("strikePrice") == strike:
-                    opt_data = record.get(normalized_type, {})
-                    record_expiry = _parse_expiry_date(opt_data.get("expiryDate"))
-                    if record_expiry and record_expiry.date() == selected_expiry.date():
-                        price = float(opt_data.get("lastPrice", 0.0))
-                        if price > 0:
-                            _store_option_ltp(cache_key, price)
-                            return price
-        except Exception as exc:
-            if attempt == retries - 1:
-                print(f"NSE option LTP unavailable for {symbol} {strike} {normalized_type}: {exc}")
-        if attempt < retries - 1:
-            time.sleep(1)
-
-    # If NSE is temporarily unavailable after a successful lookup, retain the
-    # last known quote rather than returning a misleading blank live P&L.
-    return _cached_option_ltp(cache_key)
 
 def estimate_option_premium(spot: float, strike: int, signal: str, days_to_expiry: int = 5) -> float:
     """
@@ -226,6 +276,7 @@ def estimate_option_premium(spot: float, strike: int, signal: str, days_to_expir
         return round(max(5.0, premium), 1)
     except Exception:
         return round(spot * 0.005, 1)  # ~0.5% of spot as fallback
+
 
 def build_options_info(symbol: str, signal: str, spot_price: float) -> dict:
     """
@@ -253,18 +304,19 @@ def build_options_info(symbol: str, signal: str, spot_price: float) -> dict:
         days = (fallback_expiry.date() - now.date()).days
         if days == 0:
             days = 0.1 if now.time() > dt_time(15, 30) else 0.5
-        
-    # Attempt "Jugaad" to fetch Live NSE Option LTP first
-    premium = get_live_nse_option_ltp(symbol, opt_type, strike)
+
+    est_premium = estimate_option_premium(spot_price, strike, signal, days)
+
+    # Look up live security ID and real-time LTP from Dhan
+    security_id = get_dhan_option_security_id(symbol_key, opt_type, strike, expiry)
+    segment = "BSE_FNO" if symbol_key == "SENSEX" else "NSE_FNO"
+    real_ltp = get_dhan_option_ltp(security_id or "", segment) if security_id else None
+    premium = float(real_ltp) if real_ltp and real_ltp > 0 else float(est_premium)
     
-    # Preserve the previous behavior if NSE's option-chain response is unavailable.
-    if premium is None or premium <= 0:
-        premium = estimate_option_premium(spot_price, strike, signal, days_to_expiry=days)
-    
-    stop_loss_risk_pct = 0.05 if symbol_key == "NIFTY" else 0.15
+    stop_loss_risk_pct = 0.18
     sl = round(premium * (1 - stop_loss_risk_pct), 1)
-    t1 = round(premium * 1.80, 1)
-    t2 = round(premium * 2.50, 1)
+    t1 = round(premium * 1.25, 1)
+    t2 = round(premium * 1.60, 1)
 
     return {
         "opt_type": opt_type,
@@ -272,6 +324,7 @@ def build_options_info(symbol: str, signal: str, spot_price: float) -> dict:
         "expiry": expiry,
         "lot_size": lot_size,
         "premium": premium,
+        "security_id": security_id,
         "sl": sl,
         "t1": t1,
         "t2": t2,

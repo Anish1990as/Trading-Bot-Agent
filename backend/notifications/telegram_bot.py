@@ -11,10 +11,16 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     def _print_to_terminal(self, text: str) -> None:
-        terminal_text = unescape(re.sub(r"</?[^>]+>", "", text))
-        print("\n--- Telegram Message ---")
-        print(terminal_text)
-        print("--- End Telegram Message ---\n")
+        try:
+            terminal_text = unescape(re.sub(r"</?[^>]+>", "", text))
+            print("\n--- Telegram Message ---")
+            try:
+                print(terminal_text)
+            except UnicodeEncodeError:
+                print(terminal_text.encode('ascii', errors='replace').decode('ascii'))
+            print("--- End Telegram Message ---\n")
+        except Exception:
+            pass
 
     def send_message(self, text: str) -> bool:
         self._print_to_terminal(text)

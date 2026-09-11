@@ -1,9 +1,8 @@
 import base64
 import json
-import multiprocessing
 import os
+import time
 from datetime import datetime, timedelta
-from queue import Empty
 
 import pandas as pd
 import pytz
@@ -11,33 +10,12 @@ import requests
 from dotenv import load_dotenv
 
 
-def _download_yfinance(
-    yf_symbol: str,
-    period: str,
-    interval: str,
-    output: multiprocessing.Queue,
-) -> None:
-    """Run yfinance outside the daemon so a stuck request can be terminated."""
-    try:
-        import yfinance as yf
-
-        df = yf.download(
-            tickers=yf_symbol,
-            period=period,
-            interval=interval,
-            progress=False,
-            timeout=30,
-        )
-        output.put(("ok", df))
-    except Exception as exc:
-        output.put(("error", str(exc)))
-
-
 class MarketDataFetcher:
     DHAN_INTRADAY_URL = "https://api.dhan.co/v2/charts/intraday"
     DHAN_INDEXES = {
         "NIFTY": "13",
         "BANKNIFTY": "25",
+        "SENSEX": "51",
     }
     DHAN_INTERVALS = {
         "1m": "1",
@@ -49,33 +27,41 @@ class MarketDataFetcher:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
+        self._cache = {}
+        self._cache_time = {}
+        self._last_request_time = 0.0
+        self._sync_credentials()
 
-        # This class is also created by the API process, where app_daemon's
-        # load_dotenv() call is not executed.
-        load_dotenv()
+    def _sync_credentials(self):
+        load_dotenv(override=True)
         self.dhan_client_id = os.getenv("DHAN_CLIENT_ID")
         self.dhan_access_token = os.getenv("DHAN_ACCESS_TOKEN")
         self._dhan_auth_failed = self._jwt_is_expired(self.dhan_access_token)
-        if self._dhan_auth_failed:
-            print(
-                "Dhan access token has expired; "
-                "using fallback market data for this process."
-            )
 
     def fetch_live_data(self, symbol: str, exchange: str, timeframe: str) -> pd.DataFrame:
-        """Fetch recent candles, preferring Dhan and using bounded fallbacks."""
+        """Fetch recent candles from Dhan only with caching and fallback."""
         symbol = symbol.upper()
+        now_ts = time.time()
+        cache_key = f"{symbol}_{timeframe}"
+        if cache_key in self._cache and (now_ts - self._cache_time.get(cache_key, 0)) < 3.0:
+            return self._cache[cache_key].copy()
+
+        self._sync_credentials()
         df = pd.DataFrame()
 
         if self._can_use_dhan(symbol, timeframe):
             df = self._fetch_dhan(symbol, timeframe)
 
-        # Yahoo is a bounded emergency fallback. The unofficial TradingView
-        # websocket was removed because it caused repeated blocking timeouts.
         if df.empty:
-            df = self._fetch_yfinance_fallback(symbol, timeframe)
-        if df.empty:
-            print(f"No market data available for {symbol} {timeframe}.")
+            filepath = os.path.join(self.data_dir, f"{symbol}_{timeframe}.parquet")
+            if os.path.exists(filepath):
+                try:
+                    cached_df = pd.read_parquet(filepath)
+                    if not cached_df.empty:
+                        return cached_df
+                except Exception:
+                    pass
+            print(f"No Dhan market data available for {symbol} {timeframe}.")
             return pd.DataFrame()
 
         try:
@@ -86,6 +72,8 @@ class MarketDataFetcher:
             # Strategies only need recent candles. Keeping this bounded also
             # reduces parquet writes and indicator calculation time.
             df = df.tail(500).reset_index(drop=True)
+            self._cache[cache_key] = df
+            self._cache_time[cache_key] = now_ts
             filepath = os.path.join(self.data_dir, f"{symbol}_{timeframe}.parquet")
             df.to_parquet(filepath, index=False)
             return df
@@ -116,6 +104,10 @@ class MarketDataFetcher:
             return False
 
     def _fetch_dhan(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        elapsed = time.time() - self._last_request_time
+        if elapsed < 0.2:
+            time.sleep(0.2 - elapsed)
+
         now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
         payload = {
             "securityId": self.DHAN_INDEXES[symbol],
@@ -134,6 +126,7 @@ class MarketDataFetcher:
         }
 
         try:
+            self._last_request_time = time.time()
             response = requests.post(
                 self.DHAN_INTRADAY_URL,
                 headers=headers,
@@ -144,8 +137,11 @@ class MarketDataFetcher:
                 self._dhan_auth_failed = True
                 print(
                     "Dhan access token is invalid or expired; "
-                    "using fallback market data for this process."
+                    "market data is disabled."
                 )
+                return pd.DataFrame()
+            if response.status_code == 429:
+                time.sleep(1.0)
                 return pd.DataFrame()
             response.raise_for_status()
             data = response.json()
@@ -161,72 +157,12 @@ class MarketDataFetcher:
                 return pd.DataFrame()
             return pd.DataFrame({key: data[key] for key in required})
         except requests.RequestException as exc:
-            print(f"Dhan data unavailable for {symbol}: {exc}")
+            if "429" not in str(exc):
+                print(f"Dhan data unavailable for {symbol}: {exc}")
             return pd.DataFrame()
         except (TypeError, ValueError) as exc:
             print(f"Invalid Dhan response for {symbol}: {exc}")
             return pd.DataFrame()
-
-    def _fetch_yfinance_fallback(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        yf_symbol = {
-            "NIFTY": "^NSEI",
-            "BANKNIFTY": "^NSEBANK",
-        }.get(symbol, symbol if symbol.endswith(".NS") else f"{symbol}.NS")
-        yf_interval = {
-            "1m": "1m",
-            "3m": "5m",
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1h",
-            "1d": "1d",
-        }.get(timeframe, "5m")
-
-        period = "7d" if yf_interval == "1m" else "1mo"
-        context = multiprocessing.get_context("spawn")
-        output = context.Queue(maxsize=1)
-        process = context.Process(
-            target=_download_yfinance,
-            args=(yf_symbol, period, yf_interval, output),
-            daemon=True,
-        )
-
-        try:
-            process.start()
-            status, result = output.get(timeout=45)
-            process.join(timeout=2)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2)
-            if status == "error":
-                print(f"Yahoo Finance fallback failed for {symbol}: {result}")
-                return pd.DataFrame()
-
-            df = result
-            if df is None or df.empty:
-                return pd.DataFrame()
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [column[0].lower() for column in df.columns]
-            else:
-                df.columns = [column.lower() for column in df.columns]
-
-            df = df.reset_index()
-            datetime_column = "Datetime" if "Datetime" in df.columns else "Date"
-            if datetime_column in df.columns:
-                df = df.rename(columns={datetime_column: "datetime"})
-            return df
-        except Empty:
-            print(f"Yahoo Finance fallback timed out for {symbol} after 45 seconds.")
-            return pd.DataFrame()
-        except Exception as exc:
-            print(f"Yahoo Finance fallback failed for {symbol}: {exc}")
-            return pd.DataFrame()
-        finally:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2)
-            output.close()
 
     @staticmethod
     def _normalise_candles(df: pd.DataFrame) -> pd.DataFrame:

@@ -9,8 +9,6 @@ pandas-ta
 pytz
 APScheduler
 requests
-yfinance
-jugaad-data
 python-telegram-bot
 python-dotenv
 pyarrow

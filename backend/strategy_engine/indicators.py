@@ -128,3 +128,21 @@ def supertrend_direction(
             )
 
     return direction
+
+
+def adx(df: pd.DataFrame, length: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Calculate Average Directional Index (ADX), +DI, and -DI for Trend Strength and Chop Detection."""
+    tr = true_range(df)
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr_smoothed = tr.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False, min_periods=length).mean() / tr_smoothed.replace(0, float("nan")))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False, min_periods=length).mean() / tr_smoothed.replace(0, float("nan")))
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))).fillna(0.0)
+    adx_series = dx.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    return adx_series, plus_di, minus_di

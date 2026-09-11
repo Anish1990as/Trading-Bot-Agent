@@ -37,29 +37,17 @@ class MarketDataFetcherTests(unittest.TestCase):
             self.assertTrue(fetcher._dhan_auth_failed)
             self.assertFalse(fetcher._can_use_dhan("NIFTY", "5m"))
 
-    def test_yahoo_success_is_used_after_dhan_failure(self):
+    def test_dhan_failure_returns_no_data_without_fallback(self):
         with tempfile.TemporaryDirectory() as data_dir, patch.dict(
             "os.environ",
             {"DHAN_CLIENT_ID": "client", "DHAN_ACCESS_TOKEN": "not-a-jwt"},
         ):
             fetcher = MarketDataFetcher(data_dir)
-            candles = pd.DataFrame(
-                {
-                    "datetime": [datetime(2026, 6, 29, 4, 0, tzinfo=timezone.utc)],
-                    "open": [25000.0],
-                    "high": [25010.0],
-                    "low": [24990.0],
-                    "close": [25005.0],
-                    "volume": [100],
-                }
-            )
             fetcher._fetch_dhan = Mock(return_value=pd.DataFrame())
-            fetcher._fetch_yfinance_fallback = Mock(return_value=candles)
 
             result = fetcher.fetch_live_data("NIFTY", "NSE", "5m")
 
-            self.assertEqual(len(result), 1)
-            fetcher._fetch_yfinance_fallback.assert_called_once_with("NIFTY", "5m")
+            self.assertTrue(result.empty)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Write-Host "Starting backend on http://127.0.0.1:8000 ..."
 Start-Process powershell.exe -ArgumentList @(
     "-NoExit",
     "-Command",
-    "Set-Location '$backendDir'; py -3.13 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000"
+    "Set-Location '$backendDir'; py -3.13 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload"
 )
 
 Start-Sleep -Seconds 2
